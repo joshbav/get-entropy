@@ -1,0 +1,105 @@
+# Revision 1-9-17, tested on CentOS 7.3
+# By JoshB @ Mesosphere
+# This is a custom onshot systemd unit that is ran on startup.
+# It seeds /dev/random, and is useful for some IoT devices
+#
+# In theory a systemd timer could be used to re run this unit every X hours, but that's
+#  not likely necessary.
+#
+# An HTTPS request is made to nist.gov, thus ca-certificates is required so
+#  validation of the TLS cert can occur. sudo yum install -y ca-certificates
+#
+# Myths about /dev/random and /dev/urandom:  https://www.2uo.de/myths-about-urandom/
+#
+# Writing to /dev/random doesn't increase the entropy_avail counter,
+#  it just stirs the existing pool which is not very deterministic but I suspect 
+#  it would likely be good enough.
+#  Kernel source for writes to /dev/random: https://elixir.bootlin.com/linux/v3.10/source/drivers/char/random.c#L1257
+#  Therefore https://raw.githubusercontent.com/rfinnie/twuewand/master/rndaddentropy/rndaddentropy.c is used
+#  since it directly writes to the entrophy pool, thus increasing it.
+
+[Unit]
+Description=Seeds /dev/random, for IoT devices with little entropy
+Documentation=
+Requires=network-online.target
+# This will run before apps are started
+Before=multi-user.target
+After=network-online.target network.target
+# Wait until NTP time is in sync, chrony is configured to block until this occurs
+After=chronyd.service
+Conflicts=shutdown.target
+# sudo yum install -y curl ca-certificates
+ConditionPathExists=/bin/curl
+ConditionPathExists=/sbin/ip
+ConditionPathExists=/usr/bin/base64
+ConditionPathExists=/bin/cat
+# Will be slow on IoT devices
+ConditionPathExists=/bin/sha512sum
+# sudo yum install -y chrony
+# also use my chrony.conf as mentioned in README.md
+ConditionPathExists=/usr/sbin/chronyd
+# sudo yum install -y jq
+ConditionPathExists=/usr/bin/jq
+ConditionPathExists=/usr/bin/xxd
+# Must be installed prior to use, is in this repo
+ConditionPathExists=/sbin/rndaddentropy
+
+[Service]
+Type=oneshot
+# Keep unit running after the commands have been executed, even though no process is running.
+# This allows other units to require this one.
+RemainAfterExit=true
+StandardOutput=journal+console
+StandardError=journal+console
+EnvironmentFile=
+# Note systemd starts executables as root by default, thus no use of sudo below,
+# and full paths are required
+ExecStartPre=
+
+# Getting current level of entropy in the kernel
+ExecStart=/usr/bin/bash -c "echo Starting. Kernel has $(cat /proc/sys/kernel/random/entropy_avail) bits of entropy, less than 100 is bad"
+
+# A free entropy service on the Internet from nist.gov
+# The signature value is larger than anything else, so going to use it instead
+# base64 will try to decode it and create ascii, since we don't want to feed hex or base64 to the entropy pool
+ExecStart=/usr/bin/bash -c "echo Fetching entropy from nist.gov via curl, adding to kernel entropy"
+ExecStart=/usr/bin/bash -c "/usr/bin/curl -sSLX GET 'https://beacon.nist.gov/beacon/2.0/pulse/last' | /usr/bin/jq '.pulse.signatureValue' -r | /usr/bin/base64 --decode --ignore-garbage | /sbin/rndaddentropy"
+
+# Another free entropy service on the Internet. Note they will block an IP that has used more than 1Mbits in 24 hours
+#  and they have a paid service.
+# It will be provided in hex, xxd will convert it to ascii
+ExecStart=/usr/bin/bash -c "echo Fetching 2Kb of entropy from random.org via curl, adding to kernel entropy"
+ExecStart=/usr/bin/bash -c "/usr/bin/curl -sSLX GET 'https://www.random.org/cgi-bin/randbyte?nbytes=2048&format=h' | xxd -r -p - | /sbin/rndaddentropy"
+
+# In case the above two are firewalled, the following methods will still increase entropy
+
+# The local mac address will provide a little bit of psudorandomness
+# This unit is only ran after the network is online
+ExecStart=/usr/bin/bash -c "echo Doing  ip -f link maddress show   command to get mac addresses, hashing, decoding, adding to kernel entropy"
+ExecStart=/usr/bin/bash -c "/sbin/ip -f link maddress show | /bin/sha512sum | /usr/bin/base64 --decode --ignore-garbage | /sbin/rndaddentropy"
+
+# Chrony NTP stats about its servers
+# Chrony will already be in sync before this unit runs
+ExecStart=/usr/bin/bash -c "echo Fetching detailed NTP data using chronyc utility, hashing, decoding, adding to kernel entropy"
+# No need for sudo since systemd units run as root
+ExecStart=/usr/bin/bash -c "/bin/chronyc ntpdata | /bin/sha512sum | /usr/bin/base64 --decode --ignore-garbage | /sbin/rndaddentropy"
+
+# Take the boot_id, which is psudorandom from each boot, and use it
+ExecStart=/usr/bin/bash -c "echo Copying boot_id, hashing, adding to kernel entropy"
+ExecStart=/usr/bin/bash -c "/bin/cat /proc/sys/kernel/random/boot_id | /bin/sha512sum | /usr/bin/base64 --decode --ignore-garbage | /sbin/rndaddentropy"
+
+# Now that we've added entropy, we need to stir it using locally generated data.
+# This is because in theory a man-in-the-middle attack might just know some of
+# The entropy, which really isn't a big deal since some of the entropy is locally generated.
+# But let's be paranoiod anyhow.
+# Writing to /dev/random does not increase entropy, it just stirs what's already there.
+# Also, the kernel hashes the input data when writing to /dev/random, so we don't need to hash the data first.
+ExecStart=/usr/bin/bash -c "echo Stirring entropy pool by copying detailed NTP data from chronyc utility"
+ExecStart=/usr/bin/bash -c "/bin/chronyc ntpdata >> /dev/random"
+
+# Getting current level of entropy in the kernel
+ExecStart=/usr/bin/bash -c "echo Done. Kernel now has $(cat /proc/sys/kernel/random/entropy_avail) bits of entropy, less than 100 is bad"
+# Note ExecStopPost entries are ran regardless of the outcome of ExecStartPre and ExecStart commands
+
+[Install]
+WantedBy=multi-user.target
